@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -81,6 +83,10 @@ func (s *Cluster) LifecycleEventQueueURL() (string, error) {
 func (s *Cluster) WatchLifecycleEvents(queueURL string, cb LifecyleEventCallback) error {
 	sqsSvc := sqs.New(s.AwsSession)
 	autoscalingSvc := autoscaling.New(s.AwsSession)
+	timeout, err := visibilityTimeout(sqsSvc, queueURL)
+	if err != nil {
+		return err
+	}
 
 	for {
 		resp, err := sqsSvc.ReceiveMessage(&sqs.ReceiveMessageInput{
@@ -107,7 +113,9 @@ func (s *Cluster) WatchLifecycleEvents(queueURL string, cb LifecyleEventCallback
 				continue
 			}
 
-			shouldContinue, err := cb(&m)
+			stop, _ := renewMessageVisibilityTimeout(sqsSvc, queueURL, messageWrapper.ReceiptHandle, timeout)
+			shouldContinue, err := runCallback(cb, &m)
+			close(stop)
 			if err != nil {
 				continue
 			}
@@ -136,4 +144,71 @@ func (s *Cluster) WatchLifecycleEvents(queueURL string, cb LifecyleEventCallback
 			}
 		}
 	}
+}
+
+func runCallback(cb LifecyleEventCallback, message *LifecycleMessage) (shouldContinue bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if _, ok := r.(runtime.Error); ok {
+				panic(r)
+			}
+			err = r.(error)
+		}
+	}()
+	return cb(message)
+}
+
+func renewMessageVisibilityTimeout(sqsSvc *sqs.SQS, queueURL string, receiptHandle *string, timeout int) (stop chan struct{}, errChan chan error) {
+	stop = make(chan struct{}, 1)
+	errChan = make(chan error, 1)
+
+	var timerDuration time.Duration
+
+	if timeout == 0 {
+		return stop, errChan
+	}
+
+	if timeout < 10 {
+		timerDuration = time.Second * time.Duration(timeout/2)
+	} else {
+		timerDuration = time.Second * time.Duration(timeout-10)
+	}
+	timer := time.NewTicker(timerDuration)
+
+	go func() {
+		for {
+			select {
+			case <-stop:
+				timer.Stop()
+				close(errChan)
+			case <-timer.C:
+				_, err := sqsSvc.ChangeMessageVisibility(&sqs.ChangeMessageVisibilityInput{
+					QueueUrl:          &queueURL,
+					ReceiptHandle:     receiptHandle,
+					VisibilityTimeout: aws.Int64(int64(timeout)),
+				})
+				if err != nil {
+					timer.Stop()
+					errChan <- err
+					close(errChan)
+				}
+			}
+		}
+	}()
+	return stop, errChan
+}
+
+func visibilityTimeout(sqsSvc *sqs.SQS, queueURL string) (int, error) {
+	attrs, err := sqsSvc.GetQueueAttributes(&sqs.GetQueueAttributesInput{
+		QueueUrl:       &queueURL,
+		AttributeNames: []*string{aws.String(sqs.QueueAttributeNameVisibilityTimeout)},
+	})
+	if err != nil {
+		return 0, err
+	}
+	timeoutString, ok := attrs.Attributes[sqs.QueueAttributeNameVisibilityTimeout]
+	if !ok {
+		return 0, fmt.Errorf("VisibilityTimeout attribute not found")
+	}
+	return strconv.Atoi(*timeoutString)
 }
