@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
@@ -80,19 +79,16 @@ func (s *Cluster) LifecycleEventQueueURL() (string, error) {
 // cb for each event. If the callback returns an error, then the
 // lifecycle action is completed with ABANDON. On success, the event is
 // completed with CONTINUE.
-func (s *Cluster) WatchLifecycleEvents(queueURL string, cb LifecyleEventCallback) error {
+func (s *Cluster) WatchLifecycleEvents(queueURL string, cb LifecyleEventCallback, visibilityTimeout int64) error {
 	sqsSvc := sqs.New(s.AwsSession)
 	autoscalingSvc := autoscaling.New(s.AwsSession)
-	timeout, err := visibilityTimeout(sqsSvc, queueURL)
-	if err != nil {
-		return err
-	}
 
 	for {
 		resp, err := sqsSvc.ReceiveMessage(&sqs.ReceiveMessageInput{
 			QueueUrl:            &queueURL,
 			MaxNumberOfMessages: aws.Int64(1),
 			WaitTimeSeconds:     aws.Int64(20),
+			VisibilityTimeout:   aws.Int64(visibilityTimeout),
 		})
 		if err != nil {
 			return err
@@ -113,7 +109,7 @@ func (s *Cluster) WatchLifecycleEvents(queueURL string, cb LifecyleEventCallback
 				continue
 			}
 
-			stop, _ := renewMessageVisibilityTimeout(sqsSvc, queueURL, messageWrapper.ReceiptHandle, timeout)
+			stop, _ := renewMessageVisibilityTimeout(sqsSvc, queueURL, messageWrapper.ReceiptHandle, visibilityTimeout)
 			shouldContinue, err := runCallback(cb, &m)
 			close(stop)
 			if err != nil {
@@ -158,7 +154,7 @@ func runCallback(cb LifecyleEventCallback, message *LifecycleMessage) (shouldCon
 	return cb(message)
 }
 
-func renewMessageVisibilityTimeout(sqsSvc *sqs.SQS, queueURL string, receiptHandle *string, timeout int) (stop chan struct{}, errChan chan error) {
+func renewMessageVisibilityTimeout(sqsSvc *sqs.SQS, queueURL string, receiptHandle *string, timeout int64) (stop chan struct{}, errChan chan error) {
 	stop = make(chan struct{}, 1)
 	errChan = make(chan error, 1)
 
@@ -186,7 +182,7 @@ func renewMessageVisibilityTimeout(sqsSvc *sqs.SQS, queueURL string, receiptHand
 				_, err := sqsSvc.ChangeMessageVisibility(&sqs.ChangeMessageVisibilityInput{
 					QueueUrl:          &queueURL,
 					ReceiptHandle:     receiptHandle,
-					VisibilityTimeout: aws.Int64(int64(timeout)),
+					VisibilityTimeout: aws.Int64(timeout),
 				})
 				if err != nil {
 					timer.Stop()
@@ -198,19 +194,4 @@ func renewMessageVisibilityTimeout(sqsSvc *sqs.SQS, queueURL string, receiptHand
 		}
 	}()
 	return stop, errChan
-}
-
-func visibilityTimeout(sqsSvc *sqs.SQS, queueURL string) (int, error) {
-	attrs, err := sqsSvc.GetQueueAttributes(&sqs.GetQueueAttributesInput{
-		QueueUrl:       &queueURL,
-		AttributeNames: []*string{aws.String(sqs.QueueAttributeNameVisibilityTimeout)},
-	})
-	if err != nil {
-		return 0, err
-	}
-	timeoutString, ok := attrs.Attributes[sqs.QueueAttributeNameVisibilityTimeout]
-	if !ok {
-		return 0, fmt.Errorf("VisibilityTimeout attribute not found")
-	}
-	return strconv.Atoi(*timeoutString)
 }
