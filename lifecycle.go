@@ -181,6 +181,7 @@ func renewMessageVisibilityTimeout(sqsSvc *sqs.SQS, queueURL string, receiptHand
 			case <-stop:
 				timer.Stop()
 				close(errChan)
+				return
 			case <-timer.C:
 				_, err := sqsSvc.ChangeMessageVisibility(&sqs.ChangeMessageVisibilityInput{
 					QueueUrl:          &queueURL,
@@ -191,6 +192,7 @@ func renewMessageVisibilityTimeout(sqsSvc *sqs.SQS, queueURL string, receiptHand
 					timer.Stop()
 					errChan <- err
 					close(errChan)
+					return
 				}
 			}
 		}
